@@ -21,3 +21,5 @@ _rel/
 .eunit/
 .rebar/
 rebar.lock
+*.iml
+.idea

@@ -3,9 +3,8 @@ PROJECT_DESCRIPTION = Kafka client library in Erlang
 PROJECT_VERSION = 2.2.15
 
 DEPS = supervisor3 kafka_protocol
-
-dep_supervisor3_commit = 1.1.5
-dep_kafka_protocol_commit = 0.7.8
+dep_supervisor3 git https://github.com/klarna/supervisor3.git 1.1.5
+dep_kafka_protocol git https://github.com/klarna/kafka_protocol.git 0.7.8
 
 TEST_DEPS = meck proper
 
