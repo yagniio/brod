@@ -462,16 +462,21 @@ handle_fetch_error(#kafka_fetch_error{error_code = ErrorCode} = Error,
 %% @private
 handle_reset_offset(#state{ subscriber          = Subscriber
                           , offset_reset_policy = reset_by_subscriber
+                          , topic               = Topic
+                          , partition           = Partition
                           } = State, Error) ->
   ok = cast_to_subscriber(Subscriber, Error),
   %% Suspend, no more fetch request until the subscriber re-subscribes
-  error_logger:info_msg("~p ~p consumer is suspended, "
+  error_logger:info_msg("~s-~p consumer is suspended, "
                         "waiting for subscriber ~p to resubscribe with "
-                        "new begin_offset", [?MODULE, self(), Subscriber]),
+                        "new begin_offset", [Topic, Partition, Subscriber]),
   {noreply, State#state{is_suspended = true}};
-handle_reset_offset(#state{offset_reset_policy = Policy} = State, _Error) ->
-  error_logger:info_msg("~p ~p offset out of range, applying reset policy ~p",
-                        [?MODULE, self(), Policy]),
+handle_reset_offset(#state{ offset_reset_policy = Policy
+                          , topic               = Topic
+                          , partition           = Partition
+                          } = State, _Error) ->
+  error_logger:info_msg("~s-~p offset out of range, applying reset policy ~p",
+                        [Topic, Partition, Policy]),
   BeginOffset = case Policy of
                   reset_to_earliest -> ?OFFSET_EARLIEST;
                   reset_to_latest   -> ?OFFSET_LATEST
