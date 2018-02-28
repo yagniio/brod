@@ -55,12 +55,13 @@
                              | reset_to_latest.
 
 -type bytes() :: non_neg_integer().
--type offset_range() :: {offset(), offset()}.
+-type offset_range() :: {Begin :: offset(), End :: offset(), Bytes :: bytes()}.
 -type offsets_queue() :: queue:queue(offset_range()).
 -type config() :: proplists:proplist().
 
--record(pending_acks, { count         = 0            :: integer()
-                      , offsets_queue = queue:new()  :: offsets_queue()
+-record(pending_acks, { count = 0 :: integer()
+                      , bytes = 0 :: integer()
+                      , offsets_queue = queue:new() :: offsets_queue()
                       }).
 
 -type pending_acks() :: #pending_acks{}.
@@ -74,7 +75,7 @@
                , min_bytes           :: bytes()
                , max_bytes_orig      :: bytes()
                , sleep_timeout       :: integer()
-               , prefetch_count      :: integer()
+               , prefetch            :: integer()
                , last_corr_id        :: ?undef | corr_id()
                , subscriber          :: ?undef | pid()
                , subscriber_mref     :: ?undef | reference()
@@ -124,8 +125,10 @@ start_link(ClientPid, Topic, Partition, Config) ->
 %%  sleep_timeout (optional, default = 1000 ms):
 %%     Allow consumer process to sleep this amout of ms if kafka replied
 %%     'empty' message-set.
-%%  prefetch_count (optional, default = 1):
+%%  prefetch (optional, default = {count, 10}):
 %%     The window size (number of messages) allowed to fetch-ahead.
+%%     The number should be tagged with either 'count' or 'bytes' to indicate
+%%     if the windown size is meausured by number of messages or data volume.
 %%  begin_offset (optional, default = latest):
 %%     The offset from which to begin fetch requests.
 %%  offset_reset_policy (optional, default = reset_by_subscriber)
@@ -197,7 +200,6 @@ init({ClientPid, Topic, Partition, Config}) ->
   MaxBytes = Cfg(max_bytes, ?DEFAULT_MAX_BYTES),
   MaxWaitTime = Cfg(max_wait_time, ?DEFAULT_MAX_WAIT_TIME),
   SleepTimeout = Cfg(sleep_timeout, ?DEFAULT_SLEEP_TIMEOUT),
-  PrefetchCount = erlang:max(Cfg(prefetch_count, ?DEFAULT_PREFETCH_COUNT), 1),
   BeginOffset = Cfg(begin_offset, ?DEFAULT_BEGIN_OFFSET),
   OffsetResetPolicy = Cfg(offset_reset_policy, ?DEFAULT_OFFSET_RESET_POLICY),
   ok = brod_client:register_consumer(ClientPid, Topic, Partition),
@@ -209,7 +211,7 @@ init({ClientPid, Topic, Partition, Config}) ->
              , min_bytes           = MinBytes
              , max_bytes_orig      = MaxBytes
              , sleep_timeout       = SleepTimeout
-             , prefetch_count      = PrefetchCount
+             , prefetch            = get_prefetch(Config)
              , socket_pid          = ?undef
              , pending_acks        = #pending_acks{}
              , is_suspended        = false
@@ -404,19 +406,32 @@ maybe_shrink_max_bytes(#state{ size_stat_window = W
   %% Configured to not collect average message size,
   %% shrink back to original max_bytes immediately
   State#state{max_bytes = MaxBytesOrig};
-maybe_shrink_max_bytes(#state{ prefetch_count = PrefetchCount
+maybe_shrink_max_bytes(#state{ prefetch       = {bytes, PrefetchBytes}
+                             , max_bytes_orig = MaxBytesOrig
+                             } = State, _) ->
+  State#state{max_bytes = MaxBytesOrig};
+maybe_shrink_max_bytes(#state{ prefetch       = Prefetch
                              , max_bytes_orig = MaxBytesOrig
                              , max_bytes      = MaxBytes
                              , avg_bytes      = AvgBytes
                              } = State, []) ->
   %% This is the estimated size of a message set based on the
   %% average size of the last X messages.
-  EstimatedSetSize = erlang:round(PrefetchCount * AvgBytes),
+  EstimatedSetSize =
+    case Prefetch of
+      {count, C} ->
+        %% when limit fetch-ahead by count, we estimate the next batch size
+        erlang:round(C * AvgBytes);
+      {bytes, _} ->
+        %% when limit fetch-ahead by bytes, we pick average message
+        %% size incase configured max_bytes and prefetch are too small
+        lists:max([erlang:round(AvgBytes), MaxBytesOrig, Prefetch])
+    end,
   %% respect the original max_bytes config
   NewMaxBytes = erlang:max(EstimatedSetSize, MaxBytesOrig),
   %% maybe shrink the max_bytes to send in fetch request to NewMaxBytes
   State#state{max_bytes = erlang:min(NewMaxBytes, MaxBytes)};
-maybe_shrink_max_bytes(#state{ prefetch_count   = PrefetchCount
+maybe_shrink_max_bytes(#state{ prefetch         = Prefetch
                              , avg_bytes        = AvgBytes
                              , size_stat_window = Window
                              } = State,
@@ -425,7 +440,10 @@ maybe_shrink_max_bytes(#state{ prefetch_count   = PrefetchCount
   %% use 40 to give some room for future kafka protocol versions
   MsgBytes = bytes(Key) + bytes(Value) + 40,
   %% See https://en.wikipedia.org/wiki/Moving_average
-  WindowSize = erlang:max(PrefetchCount, Window),
+  WindowSize = case Prefetch of
+                 {count, C} -> erlang:max(C, Window);
+                 {bytes, _} -> Window
+               end,
   NewAvgBytes = ((WindowSize - 1) * AvgBytes + MsgBytes) / WindowSize,
   maybe_shrink_max_bytes(State#state{avg_bytes = NewAvgBytes}, Rest).
 
@@ -533,10 +551,10 @@ maybe_send_fetch_request(#state{is_suspended = true} = State) ->
 maybe_send_fetch_request(#state{last_corr_id = I} = State) when is_integer(I) ->
   %% Waiting for the last request
   State;
-maybe_send_fetch_request(#state{ pending_acks   = #pending_acks{count = Count}
-                               , prefetch_count = PrefetchCount
+maybe_send_fetch_request(#state{ pending_acks = PendingAcks
+                               , prefetch = Prefetch
                                } = State) ->
-  case Count =< PrefetchCount of
+  case continue_fetch_ahead(PendingAcks, Prefetch) of
     true ->
       case send_fetch_request(State) of
         {ok, CorrId} ->
@@ -550,7 +568,13 @@ maybe_send_fetch_request(#state{ pending_acks   = #pending_acks{count = Count}
       State
   end.
 
-%% @private
+continue_fetch_ahead(#pending_acks{count = Count}, {count, Limit}) ->
+  Count =< Limit;
+continue_fetch_ahead(#pending_acks{bytes = Bytes}, {bytes, Limit}) ->
+  Bytes =< Limit;
+continue_fetch_ahead(_, _) ->
+  false.
+
 -spec send_fetch_request(state()) -> {ok, corr_id()} | {error, any()}.
 send_fetch_request(#state{ begin_offset = BeginOffset
                          , socket_pid   = SocketPid
@@ -593,13 +617,19 @@ update_options(Options, #state{begin_offset = OldBeginOffset} = State) ->
   F = fun(Name, Default) -> proplists:get_value(Name, Options, Default) end,
   NewBeginOffset = F(begin_offset, OldBeginOffset),
   OffsetResetPolicy = F(offset_reset_policy, State#state.offset_reset_policy),
+  Prefetch =
+    case proplists:is_defined(prefetch_count, Options) orelse
+         proplists:is_defined(prefetch, Options) of
+      true  -> get_prefetch(Options);
+      false -> State#state.prefetch
+    end,
   State1 = State#state
     { begin_offset        = NewBeginOffset
     , min_bytes           = F(min_bytes, State#state.min_bytes)
     , max_bytes_orig      = F(max_bytes, State#state.max_bytes_orig)
     , max_wait_time       = F(max_wait_time, State#state.max_wait_time)
     , sleep_timeout       = F(sleep_timeout, State#state.sleep_timeout)
-    , prefetch_count      = F(prefetch_count, State#state.prefetch_count)
+    , prefetch            = Prefetch
     , offset_reset_policy = OffsetResetPolicy
     , max_bytes           = F(max_bytes, State#state.max_bytes)
     , size_stat_window    = F(size_stat_window, State#state.size_stat_window)
@@ -702,6 +732,12 @@ maybe_send_init_socket(#state{subscriber = Subscriber}) ->
   brod_utils:is_pid_alive(Subscriber) andalso
     erlang:send_after(Timeout, self(), ?INIT_SOCKET),
   ok.
+
+%% for backward compatibility, prefetch_count is still relevant
+get_prefetch(Options) ->
+  PrefetchCount = proplists:get_value(prefetch_count, Options,
+                                      ?DEFAULT_PREFETCH_COUNT),
+  proplists:get_value(prefetch, Options, {count, PrefetchCount}).
 
 %%%_* Tests ====================================================================
 
