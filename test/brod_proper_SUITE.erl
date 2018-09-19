@@ -10,8 +10,8 @@
 -define(TRACE, true).
 
 -define(TIMEOUT, 600).
--define(NUMTESTS, 100).
--define(SIZE, 1000).
+-define(NUMTESTS, 10).
+-define(SIZE, 100).
 
 -define(RUN_PROP(PROP),
         begin

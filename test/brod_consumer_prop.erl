@@ -19,7 +19,7 @@
 
 %% Test actions
 -export([ produce/3
-        , receive_messages/2
+        , receive_messages/3
         , start_subscriber/2
         , start_client/2
         , stop_subscriber/2
@@ -39,6 +39,8 @@
 
 -define(MAX_MESSAGES, 10).
 
+-define(BEGIN_OFFSET, earliest).
+
 -record(s,
         { client_id           :: atom()
         , generation_id       :: binary()
@@ -46,7 +48,7 @@
         , subscriber_config
         , produced_id = 255
         , processed_id = 255
-        , last_check = {earliest, undefined}
+        , last_check = {?BEGIN_OFFSET, undefined}
         }).
 
 -define(TEST_ACTION(Fun), {call, ?MODULE, Fun, []}).
@@ -57,7 +59,7 @@
 
 -define(PRODUCE(Gen, Id, NMsgs), ?TEST_ACTION(produce, Gen, Id, NMsgs)).
 
--define(COLLECT(Gen, LastExpected), ?TEST_ACTION(receive_messages, Gen, LastExpected)).
+-define(COLLECT(Gen, SubPid, LastExpected), ?TEST_ACTION(receive_messages, Gen, SubPid, LastExpected)).
 
 -define(START_CLIENT(ClientId, Config), ?TEST_ACTION(start_client, ClientId, Config)).
 
@@ -67,7 +69,8 @@
 
 -define(CRASH_CONSUMER(State), ?TEST_ACTION(crash_consumer, State)).
 
--define(ACK(GenId, Partition, Msg, Offset), {ack, GenId, Partition, Msg, Offset}).
+-define(ACK(SubPid, GenId, Partition, Msg, Offset),
+        {ack, SubPid, GenId, Partition, Msg, Offset}).
 
 %%% ---------------------------------------------------------------------------
 %%% Testcase entry point:
@@ -101,10 +104,11 @@ command(#s{client_id = Client, subscriber = undefined} = State)
 command(#s{ generation_id = Gen
           , produced_id = ProdID
           , processed_id = DoneID
+          , subscriber = SubPid
           } = State) ->
   frequency(
     [ {10, ?PRODUCE(Gen, ProdID + 1, range(1, ?MAX_MESSAGES))}
-    , {2,  ?COLLECT(Gen, ProdID)}
+    , {2,  ?COLLECT(Gen, SubPid, ProdID)}
     %, {1,  ?STOP_TOPIC_SUBSCRIBER(State#s.subscriber, stop_type())}
     , {5,  ?CRASH_CONSUMER(State)}
     ]).
@@ -172,12 +176,12 @@ start_client(ClientId, Config) ->
   Res = brod:start_client(?BOOTSTRAP_HOSTS, ClientId, Config),
   Res.
 
-receive_messages(Gen, LastExpected) ->
+receive_messages(Gen, SubPid, LastExpected) ->
   TRef = erlang:start_timer(?MESSAGE_DEADLINE, self(), Gen),
   FlushMessages =
     fun F({LastOffset, Acc} = OldState) ->
         receive
-          ?ACK(Gen, _, Payload, Offset) ->
+          ?ACK(SubPid, Gen, _, Payload, Offset) ->
             SeqNo = binary_to_term(Payload),
             error_logger:info_msg("~p: Got msg:~p/~p~n", [ ?MODULE
                                                          , binary_to_term(Gen)
@@ -188,6 +192,12 @@ receive_messages(Gen, LastExpected) ->
                true ->
                 F(Ret)
             end;
+          ?ACK(OtherPid, _, _, Payload, Offset) ->
+            SeqNo = binary_to_term(Payload),
+            error_logger:info_msg("~p: discarded ack message from ~p (current=~p)~n"
+                                  "~p at offset ~p~n",
+                                  [ ?MODULE, OtherPid, SubPid, SeqNo, Offset]),
+            F(OldState);
           {timeout, TRef, _} ->
             error_logger:warning_msg( "~p:Timeout waiting for messages: ~p~n"
                                     , [?MODULE, OldState]
@@ -195,22 +205,32 @@ receive_messages(Gen, LastExpected) ->
             OldState
         end
     end,
-  erlang:cancel_timer(TRef),
   {Offset, Messages} = FlushMessages({undefined, []}),
+  ok = flush_cancel_timer(TRef),
   error_logger:info_msg("All messages: ~p~n", [Messages]),
   io:format(user, "{~p->~p}", [hd(Messages), Offset]),
   {Offset, compactify(lists:reverse(Messages))}.
 
+flush_cancel_timer(TRef) ->
+  erlang:cancel_timer(TRef),
+  receive
+    {timeout, Tref, _} ->
+      ok
+  after
+    0 ->
+      ok
+  end.
+
 precondition(#s{last_check = Check}, ?CRASH_CONSUMER(_)) ->
   %% This precondition is not entirely justified; it's here to avoid
   %% corner case in the model
-  Check /= {earliest, undefined};
-precondition(#s{processed_id = From, produced_id = To}, ?COLLECT(_, _)) ->
+  Check /= {?BEGIN_OFFSET, undefined};
+precondition(#s{processed_id = From, produced_id = To}, ?COLLECT(_, _, _)) ->
   From < To;
 precondition(_State, _Command) ->
   true.
 
-postcondition(#s{processed_id = From, produced_id = To}, ?COLLECT(_, _), {_Offset, Messages}) ->
+postcondition(#s{processed_id = From, produced_id = To}, ?COLLECT(_, _, _), {_Offset, Messages}) ->
   Expected = [{From + 1, To}],
   case Messages of
     [{FromE, To}] when
@@ -240,7 +260,7 @@ next_state(State, Res, ?START_TOPIC_SUBSCRIBER(_, Config)) ->
   State#s{subscriber = Res, subscriber_config = Config};
 next_state(State, _Res, ?PRODUCE(_, N, NMsgs)) ->
   State#s{produced_id = N + NMsgs};
-next_state(State, Res, ?COLLECT(_, _)) ->
+next_state(State, Res, ?COLLECT(_, _, _)) ->
   State#s{processed_id = State#s.produced_id, last_check = Res};
 next_state(State, _Res, ?STOP_TOPIC_SUBSCRIBER(_, _)) ->
   State#s{subscriber = undefined};
@@ -273,6 +293,7 @@ subscriber_config_gen() ->
        , {prefetch_count, range(0, ?MAX_MESSAGES*8)}
        , {prefetch_bytes, range(0, 1 bsl 16)}
        , {size_stat_window, 5}
+       , {begin_offset, ?BEGIN_OFFSET}
        ]).
 
 %%% ---------------------------------------------------------------------------
@@ -281,8 +302,8 @@ subscriber_config_gen() ->
 
 init(Topic, {GenId, Parent, BeginOffset}) ->
   CommittedOffsets = case BeginOffset of
-                       earliest ->
-                         [{0, 0}];
+                       ?BEGIN_OFFSET ->
+                         [];
                        Num when is_integer(Num) ->
                          [{0, Num}]
                      end,
@@ -292,7 +313,7 @@ init(Topic, {GenId, Parent, BeginOffset}) ->
 handle_message(Partition, Msg, {GenId, ParentPid} = State) ->
   #kafka_message{value = Val, key = Key, offset = Offset} = Msg,
   if Key =:= GenId ->
-      ParentPid ! ?ACK(GenId, Partition, Val, Offset);
+      ParentPid ! ?ACK(self(), GenId, Partition, Val, Offset);
      true ->
       ok
   end,
