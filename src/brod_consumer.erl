@@ -88,6 +88,7 @@
                , size_stat_window    :: non_neg_integer()
                , prefetch_bytes      :: non_neg_integer()
                , connection_mref     :: ?undef | reference()
+               , delay_fetch_request_timer_ref :: ?undef | reference()
                }).
 
 -type state() :: #state{}.
@@ -237,6 +238,7 @@ init({ClientPid, Topic, Partition, Config}) ->
              , max_bytes           = MaxBytes
              , size_stat_window    = Cfg(size_stat_window, ?DEFAULT_AVG_WINDOW)
              , connection_mref     = ?undef
+             , delay_fetch_request_timer_ref = ?undef
              }}.
 
 handle_info(?INIT_CONNECTION, #state{subscriber = Subscriber} = State0) ->
@@ -561,10 +563,14 @@ cast_to_subscriber(Pid, Msg) ->
     ok
   end.
 
+
+
 -spec maybe_delay_fetch_request(state()) -> state().
 maybe_delay_fetch_request(#state{sleep_timeout = T} = State) when T > 0 ->
-  _ = erlang:send_after(T, self(), ?SEND_FETCH_REQUEST),
-  State;
+  TimerRef = erlang:send_after(T, self(), ?SEND_FETCH_REQUEST),
+  % State;
+  State#state{delay_fetch_request_timer_ref = TimerRef};
+
 maybe_delay_fetch_request(State) ->
   maybe_send_fetch_request(State).
 
@@ -582,6 +588,7 @@ maybe_send_fetch_request(#state{last_req_ref = R} = State)
   when is_reference(R) ->
   %% Waiting for the last request
   State;
+
 maybe_send_fetch_request(#state{ pending_acks   = #pending_acks{ count = Count
                                                                , bytes = Bytes
                                                                }
@@ -597,9 +604,11 @@ maybe_send_fetch_request(#state{ pending_acks   = #pending_acks{ count = Count
 -spec send_fetch_request(state()) -> state().
 send_fetch_request(#state{ begin_offset = BeginOffset
                          , connection = Connection
-                         } = State) ->
+                         } = #state{delay_fetch_request_timer_ref = DelayFetchRequestTimerRef} = State) ->
   (is_integer(BeginOffset) andalso BeginOffset >= 0) orelse
     erlang:error({bad_begin_offset, BeginOffset}),
+  is_reference(DelayFetchRequestTimerRef) andalso 
+    erlang:cancel_timer(DelayFetchRequestTimerRef),
   Request =
     brod_kafka_request:fetch(Connection,
                              State#state.topic,
