@@ -52,6 +52,7 @@
         , assignments_received/4
         , assignments_revoked/1
         , assign_partitions/3
+        , user_data/1
         ]).
 
 -export([ code_change/3
@@ -184,7 +185,7 @@
 %%   implemented for message processing.
 %% CbInitArg:
 %%   The term() that is going to be passed to CbModule:init/1 when
-%%   initializing the subscriger.
+%%   initializing the subscriber.
 %% @end
 -spec start_link(brod:client(), brod:group_id(), [brod:topic()],
                  brod:group_config(), brod:consumer_config(),
@@ -216,7 +217,7 @@ start_link(Client, GroupId, Topics, GroupConfig,
 %%   implemented for message processing.
 %% CbInitArg:
 %%   The term() that is going to be passed to CbModule:init/1 when
-%%   initializing the subscriger.
+%%   initializing the subscriber.
 %% @end
 -spec start_link(brod:client(), brod:group_id(), [brod:topic()],
                  brod:group_config(), brod:consumer_config(),
@@ -266,6 +267,8 @@ commit(Pid) ->
 -spec commit(pid(), brod:topic(), brod:partition(), brod:offset()) -> ok.
 commit(Pid, Topic, Partition, Offset) ->
   gen_server:cast(Pid, {commit_offset, Topic, Partition, Offset}).
+
+user_data(_Pid) -> <<>>.
 
 %%%_* APIs for group coordinator ===============================================
 
