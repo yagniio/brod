@@ -168,6 +168,8 @@
 -type value() :: undefined %% no value, transformed to <<>>
                | iodata() %% single value
                | {msg_ts(), binary()} %% one message with timestamp
+               | [?KV(key(), value())] %% backward compatible
+               | [?TKV(msg_ts(), key(), value())] %% backward compatible
                | kpro:msg_input() %% one magic v2 message
                | kpro:batch_input(). %% maybe nested batch
 
@@ -716,7 +718,7 @@ get_metadata(Hosts) ->
 %% @doc Fetch broker/topic metadata
 %% Return the message body of `metadata' response.
 %% See `kpro_schema.erl' for struct details
--spec get_metadata([endpoint()], [topic()]) ->
+-spec get_metadata([endpoint()], all | [topic()]) ->
         {ok, kpro:struct()} | {error, any()}.
 get_metadata(Hosts, Topics) ->
   brod_utils:get_metadata(Hosts, Topics).
@@ -724,7 +726,7 @@ get_metadata(Hosts, Topics) ->
 %% @doc Fetch broker/topic metadata
 %% Return the message body of `metadata' response.
 %% See `kpro_schema.erl' for struct details
--spec get_metadata([endpoint()], [topic()], conn_config()) ->
+-spec get_metadata([endpoint()], all | [topic()], conn_config()) ->
         {ok, kpro:struct()} | {error, any()}.
 get_metadata(Hosts, Topics, Options) ->
   brod_utils:get_metadata(Hosts, Topics, Options).
