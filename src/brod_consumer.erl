@@ -22,12 +22,14 @@
         , start_link/4
         , start_link/5
         , stop/1
+        , stop_maybe_kill/2
         , subscribe/3
         , unsubscribe/2
         ]).
 
 %% Debug API
 -export([ debug/2
+        , get_connection/1
         ]).
 
 %% gen_server callbacks
@@ -67,7 +69,7 @@
 
 -type pending_acks() :: #pending_acks{}.
 
--record(state, { client_pid          :: pid()
+-record(state, { bootstrap           :: pid() | brod:bootstrap()
                , connection          :: ?undef | pid()
                , topic               :: binary()
                , partition           :: integer()
@@ -113,10 +115,10 @@
 
 %%%_* APIs =====================================================================
 %% @equiv start_link(ClientPid, Topic, Partition, Config, [])
--spec start_link(pid(), topic(), partition(), config()) ->
+-spec start_link(pid() | brod:bootstrap(), topic(), partition(), config()) ->
         {ok, pid()} | {error, any()}.
-start_link(ClientPid, Topic, Partition, Config) ->
-  start_link(ClientPid, Topic, Partition, Config, []).
+start_link(Bootstrap, Topic, Partition, Config) ->
+  start_link(Bootstrap, Topic, Partition, Config, []).
 
 %% @doc Start (link) a partition consumer.
 %% Possible configs:
@@ -158,14 +160,27 @@ start_link(ClientPid, Topic, Partition, Config) ->
 %%     then let it dynamically adjust to a number around
 %%     PrefetchCount * AverageSize
 %% @end
--spec start_link(pid(), topic(), partition(), config(), [any()]) ->
+-spec start_link(pid() | brod:bootstrap(),
+                 topic(), partition(), config(), [any()]) ->
                     {ok, pid()} | {error, any()}.
-start_link(ClientPid, Topic, Partition, Config, Debug) ->
-  Args = {ClientPid, Topic, Partition, Config},
+start_link(Bootstrap, Topic, Partition, Config, Debug) ->
+  Args = {Bootstrap, Topic, Partition, Config},
   gen_server:start_link(?MODULE, Args, [{debug, Debug}]).
 
 -spec stop(pid()) -> ok | {error, any()}.
 stop(Pid) -> safe_gen_call(Pid, stop, infinity).
+
+-spec stop_maybe_kill(pid(), timeout()) -> ok.
+stop_maybe_kill(Pid, Timeout) ->
+  try
+    gen_server:call(Pid, stop, Timeout)
+  catch
+    exit : {noproc, _} ->
+      ok;
+    exit : {timeout, _} ->
+      exit(Pid, kill),
+      ok
+  end.
 
 %% @doc Subscribe or resubscribe on messages from a partition.
 %% Caller may pass in a set of options which is an extention of consumer config
@@ -205,9 +220,14 @@ debug(Pid, print) ->
 debug(Pid, File) when is_list(File) ->
   do_debug(Pid, {log_to_file, File}).
 
+%% @doc Get connection pid. Test/debug only.
+get_connection(Pid) ->
+  gen_server:call(Pid, get_connection).
+
 %%%_* gen_server callbacks =====================================================
 
-init({ClientPid, Topic, Partition, Config}) ->
+init({Bootstrap, Topic, Partition, Config}) ->
+  erlang:process_flag(trap_exit, true),
   Cfg = fun(Name, Default) ->
           proplists:get_value(Name, Config, Default)
         end,
@@ -219,8 +239,14 @@ init({ClientPid, Topic, Partition, Config}) ->
   PrefetchBytes = erlang:max(Cfg(prefetch_bytes, ?DEFAULT_PREFETCH_BYTES), 0),
   BeginOffset = Cfg(begin_offset, ?DEFAULT_BEGIN_OFFSET),
   OffsetResetPolicy = Cfg(offset_reset_policy, ?DEFAULT_OFFSET_RESET_POLICY),
-  ok = brod_client:register_consumer(ClientPid, Topic, Partition),
-  {ok, #state{ client_pid          = ClientPid
+  %% If bootstrap is a client pid, register self to the client
+  case is_shared_conn(Bootstrap) of
+    true ->
+      ok = brod_client:register_consumer(Bootstrap, Topic, Partition);
+    false ->
+      ok
+  end,
+  {ok, #state{ bootstrap           = Bootstrap
              , topic               = Topic
              , partition           = Partition
              , begin_offset        = BeginOffset
@@ -268,20 +294,27 @@ handle_info({'DOWN', _MonitorRef, process, Pid, _Reason},
                                      }),
   {noreply, NewState};
 handle_info({'DOWN', _MonitorRef, process, Pid, _Reason},
-            #state{connection = Pid} = State0) ->
-  State = State0#state{connection = ?undef, connection_mref = ?undef},
-  ok = maybe_send_init_connection(State),
-  {noreply, State};
+            #state{connection = Pid} = State) ->
+  %% monitored connection managed by brod_client
+  {noreply, handle_conn_down(State)};
+handle_info({'EXIT', Pid, _Reason}, #state{connection = Pid} = State) ->
+  %% standalone connection spawn-linked to self()
+  {noreply, handle_conn_down(State)};
 handle_info(Info, State) ->
   error_logger:warning_msg("~p ~p got unexpected info: ~p",
                           [?MODULE, self(), Info]),
   {noreply, State}.
 
+handle_call(get_connection, _From, #state{connection = C} = State) ->
+  {reply, C, State};
 handle_call({subscribe, Pid, Options}, _From,
             #state{subscriber = Subscriber} = State0) ->
   case (not brod_utils:is_pid_alive(Subscriber)) %% old subscriber died
     orelse Subscriber =:= Pid of                 %% re-subscribe
     true ->
+      %% Ensure connection is established before replying this call
+      %% because we may need the connection
+      %% to resolve begin offset (latest/earliest)
       case maybe_init_connection(State0) of
         {ok, State} ->
           handle_subscribe_call(Pid, Options, State);
@@ -319,15 +352,35 @@ handle_cast(Cast, State) ->
                           [?MODULE, self(), Cast]),
   {noreply, State}.
 
-terminate(Reason, _State) ->
-  error_logger:warning_msg("~p ~p terminating, reason:\n~p",
-                           [?MODULE, self(), Reason]),
+terminate(Reason, #state{ bootstrap = Bootstrap
+                        , topic = Topic
+                        , partition = Partition
+                        , connection = Connection
+                        }) ->
+  IsShared = is_shared_conn(Bootstrap),
+  IsNormal = brod_utils:is_normal_reason(Reason),
+  %% deregister consumer if it's shared connection and normal shutdown
+  IsShared andalso IsNormal andalso
+    brod_client:deregister_consumer(Bootstrap, Topic, Partition),
+  %% close connection if it's working standalone
+  case not IsShared andalso is_pid(Connection) of
+    true -> kpro:close_connection(Connection);
+    false -> ok
+  end,
+  %% write a log if it's not shared connection
+  IsNormal orelse error_logger:error_msg("Consumer ~s-~w terminate reason: ~p",
+                                         [Topic, Partition, Reason]),
   ok.
 
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
 %%%_* Internal Functions =======================================================
+
+handle_conn_down(State0) ->
+  State = State0#state{connection = ?undef, connection_mref = ?undef},
+  ok = maybe_send_init_connection(State),
+  State.
 
 do_debug(Pid, Debug) ->
   {ok, _} = gen:call(Pid, system, {debug, Debug}, infinity),
@@ -361,11 +414,14 @@ handle_fetch_response(#kpro_rsp{ref = Ref} = Rsp,
       handle_fetch_error(Error, State)
   end.
 
-handle_batches(?undef, [], #state{begin_offset = LastOffset} = State0) ->
-  %% A meta-batch. e.g. transactional session ID initialization message
-  %% fast-forward to the next offset.
-  %% This clause is not possilbe for fetch requests prior to version 4
-  State = State0#state{begin_offset = LastOffset + 1},
+handle_batches(?undef, [], #state{} = State0) ->
+  %% It is only possible to end up here in a incremental
+  %% fetch session, empty fetch response implies no
+  %% new messages to fetch, and no changes in partition
+  %% metadata (e.g. high watermark offset, or last stable offset) either.
+  %% Do not advance offset, try again (maybe after a delay) with
+  %% the last begin_offset in use.
+  State = maybe_delay_fetch_request(State0),
   {noreply, State};
 handle_batches(_Header, ?incomplete_batch(Size),
                #state{max_bytes = MaxBytes} = State0) ->
@@ -375,18 +431,19 @@ handle_batches(_Header, ?incomplete_batch(Size),
   State = maybe_send_fetch_request(State1),
   {noreply, State};
 handle_batches(Header, [], #state{begin_offset = BeginOffset} = State0) ->
-  HighWmOffset = kpro:find(high_watermark, Header),
+  StableOffset = brod_utils:get_stable_offset(Header),
   State =
-    case BeginOffset < HighWmOffset of
+    case BeginOffset < StableOffset of
       true ->
         %% There are chances that kafka may return empty message set
-        %% when messages are delete from a compacted topic.
+        %% when messages are deleted from a compacted topic.
         %% Since there is no way to know how big the 'hole' is
         %% we can only bump begin_offset with +1 and try again.
         State1 = State0#state{begin_offset = BeginOffset + 1},
         maybe_send_fetch_request(State1);
       false ->
-        %% we have reached the end of partition
+        %% we have either reached the end of a partition
+        %% or trying to read uncommitted messages
         %% try to poll again (maybe after a delay)
         maybe_delay_fetch_request(State0)
     end,
@@ -398,32 +455,27 @@ handle_batches(Header, Batches,
                      , topic        = Topic
                      , partition    = Partition
                      } = State0) ->
-  HighWmOffset = kpro:find(high_watermark, Header),
-  State1 = case brod_utils:flatten_batches(BeginOffset, Batches) of
-    [] ->
-      %% flatten_batches might remove all actual messages
-      %% (if they were all before BeginOffset), leaving us
-      %% with nothing in this batch.  Since there is no way
-      %% to know how big the 'hole' is we can only bump
-      %% begin_offset with +1 and try again.
-      State0#state{ begin_offset = BeginOffset + 1 };
-    Messages ->
-      MsgSet = #kafka_message_set{ topic          = Topic
-                                 , partition      = Partition
-                                 , high_wm_offset = HighWmOffset
-                                 , messages       = Messages
-                                 },
-      ok = cast_to_subscriber(Subscriber, MsgSet),
-      NewPendingAcks = add_pending_acks(PendingAcks, Messages),
-      {value, ?PENDING(LastOffset, _LastMsgSize)} =
-        queue:peek_r(NewPendingAcks#pending_acks.queue),
-      State2 = State0#state{ pending_acks = NewPendingAcks
-                           , begin_offset = LastOffset + 1
-                           },
-      maybe_shrink_max_bytes(State2, MsgSet#kafka_message_set.messages)
-  end,
-  State = maybe_send_fetch_request(State1),
-  {noreply, State}.
+  StableOffset = brod_utils:get_stable_offset(Header),
+  {NewBeginOffset, Messages} =
+    brod_utils:flatten_batches(BeginOffset, Header, Batches),
+  State1 = State0#state{begin_offset = NewBeginOffset},
+  State =
+    case Messages =:= [] of
+      true ->
+        %% All messages are before requested offset, hence dropped
+        State1;
+      false ->
+        MsgSet = #kafka_message_set{ topic          = Topic
+                                   , partition      = Partition
+                                   , high_wm_offset = StableOffset
+                                   , messages       = Messages
+                                   },
+        ok = cast_to_subscriber(Subscriber, MsgSet),
+        NewPendingAcks = add_pending_acks(PendingAcks, Messages),
+        State2 = State1#state{pending_acks = NewPendingAcks},
+        maybe_shrink_max_bytes(State2, MsgSet#kafka_message_set.messages)
+    end,
+  {noreply, maybe_send_fetch_request(State)}.
 
 %% Add received offsets to pending queue.
 add_pending_acks(PendingAcks, Messages) ->
@@ -728,15 +780,19 @@ safe_gen_call(Server, Call, Timeout) ->
 %% Init payload connection regardless of subscriber state.
 -spec maybe_init_connection(state()) ->
         {ok, state()} | {{error, any()}, state()}.
-maybe_init_connection(#state{ client_pid = ClientPid
-                        , topic      = Topic
-                        , partition  = Partition
-                        , connection = ?undef
-                        } = State0) ->
+maybe_init_connection(
+  #state{ bootstrap  = Bootstrap
+        , topic      = Topic
+        , partition  = Partition
+        , connection = ?undef
+        } = State0) ->
   %% Lookup, or maybe (re-)establish a connection to partition leader
-  case brod_client:get_leader_connection(ClientPid, Topic, Partition) of
+  case connect_leader(Bootstrap, Topic, Partition) of
     {ok, Connection} ->
-      Mref = erlang:monitor(process, Connection),
+      Mref = case is_shared_conn(Bootstrap) of
+               true -> erlang:monitor(process, Connection);
+               false -> ?undef %% linked
+             end,
       %% Switching to a new connection
       %% the response for last_req_ref will be lost forever
       State = State0#state{ last_req_ref = ?undef
@@ -745,11 +801,18 @@ maybe_init_connection(#state{ client_pid = ClientPid
                           },
       {ok, State};
     {error, Reason} ->
-      {{error, Reason}, State0}
+      {{error, {connect_leader, Reason}}, State0}
   end;
 maybe_init_connection(State) ->
   {ok, State}.
 
+connect_leader(ClientPid, Topic, Partition) when is_pid(ClientPid) ->
+  brod_client:get_leader_connection(ClientPid, Topic, Partition);
+connect_leader(Endpoints, Topic, Partition) when is_list(Endpoints) ->
+  connect_leader({Endpoints, []}, Topic, Partition);
+connect_leader({Endpoints, ConnCfg}, Topic, Partition) ->
+  %% connection pid is linked to self()
+  kpro:connect_partition_leader(Endpoints, ConnCfg, Topic, Partition).
 
 %% Send a ?INIT_CONNECTION delayed loopback message to re-init.
 -spec maybe_send_init_connection(state()) -> ok.
@@ -759,6 +822,9 @@ maybe_send_init_connection(#state{subscriber = Subscriber}) ->
   brod_utils:is_pid_alive(Subscriber) andalso
     erlang:send_after(Timeout, self(), ?INIT_CONNECTION),
   ok.
+
+%% In case 'bootstrap' is a client pid, connection is shared with other workers.
+is_shared_conn(Bootstrap) -> is_pid(Bootstrap).
 
 %%%_* Tests ====================================================================
 

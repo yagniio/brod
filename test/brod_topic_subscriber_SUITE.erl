@@ -209,7 +209,8 @@ t_begin_offset(Config) when is_list(Config) ->
   SendFun =
     fun(I) ->
       Value = integer_to_binary(I),
-      {ok, Offset} = brod:produce_sync_offset(?CLIENT_ID, ?TOPIC, Partition, <<>>, Value),
+      {ok, Offset} = brod:produce_sync_offset(?CLIENT_ID, ?TOPIC,
+                                              Partition, <<>>, Value),
       Offset
     end,
   RecvFun =
@@ -229,7 +230,8 @@ t_begin_offset(Config) when is_list(Config) ->
   Offset1 = SendFun(222),
   Offset2 = SendFun(333),
   %% Start as if committed Offset1, expect it to start fetching from Offset2
-  InitArgs = {CaseRef, CasePid, _IsAsyncAck = true, _ConsumerOffsets = [{0, Offset1}]},
+  InitArgs = {CaseRef, CasePid, _IsAsyncAck = true,
+              _ConsumerOffsets = [{0, Offset1}]},
   {ok, SubscriberPid} =
     brod:start_link_topic_subscriber(?CLIENT_ID, ?TOPIC, ConsumerConfig,
                                      ?MODULE, InitArgs),
@@ -280,8 +282,8 @@ t_consumer_crash(Config) when is_list(Config) ->
   sys:get_state(SubscriberPid),
   {ok, ConsumerPid} = brod:get_consumer(?CLIENT_ID, ?TOPIC, Partition),
   Mon = monitor(process, ConsumerPid),
-  exit(ConsumerPid, test_consumer_restart),
-  receive {'DOWN', Mon, process, ConsumerPid, test_consumer_restart} -> ok
+  exit(ConsumerPid, kill),
+  receive {'DOWN', Mon, process, ConsumerPid, killed} -> ok
   after 1000 -> ct:fail("timed out waiting for the consumer process to die")
   end,
   %% ack all previously received messages

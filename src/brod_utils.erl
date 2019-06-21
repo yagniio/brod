@@ -24,13 +24,16 @@
         , bytes/1
         , describe_groups/3
         , epoch_ms/0
+        , fetch/4
         , fetch/5
+        , fold/8
         , fetch_committed_offsets/3
         , fetch_committed_offsets/4
-        , flatten_batches/2
+        , flatten_batches/3
         , get_metadata/1
         , get_metadata/2
         , get_metadata/3
+        , get_stable_offset/1
         , group_per_key/1
         , group_per_key/2
         , init_sasl_opt/1
@@ -173,22 +176,93 @@ assert_topic(Topic) ->
   ok_when(is_binary(Topic) andalso size(Topic) > 0, {bad_topic, Topic}).
 
 %% @doc Make a flat message list from decoded batch list.
--spec flatten_batches(offset(), [kpro:batch()]) -> [kpro:message()].
-flatten_batches(BeginOffset, Batches) ->
-  MsgList = lists:append([Msgs || {_Meta, Msgs} <- Batches]),
-  drop_old_messages(BeginOffset, MsgList).
+%% Return the next beging-offset together with the messages.
+-spec flatten_batches(offset(), map(), [kpro:batch()]) ->
+        {offset(), [kpro:message()]}.
+flatten_batches(BeginOffset, _, []) ->
+  %% empty batch implies we have reached the end of a partition,
+  %% we do not want to advance begin-offset here,
+  %% instead, we should try again (after a delay) with the same offset
+  {BeginOffset, []};
+flatten_batches(BeginOffset, Header, Batches0) ->
+  {LastMeta, _} = lists:last(Batches0),
+  Batches = drop_aborted(Header, Batches0),
+  MsgList = lists:append([Msgs || {Meta, Msgs} <- Batches,
+                                  not is_control(Meta)]),
+  case LastMeta of
+    #{last_offset := LastOffset} ->
+      %% For magic v2 messages, there is information about last
+      %% offset of a given batch in its metadata.
+      %% Make use of this information to fast-forward to the next
+      %% batch's base offset.
+      {LastOffset + 1, drop_old_messages(BeginOffset, MsgList)};
+    _ when MsgList =/= [] ->
+      %% This is an old version (magic v0 or v1) message set.
+      %% Use OffsetOfLastMessage + 1 as begin_offset in the next fetch request
+      #kafka_message{offset = Offset} = lists:last(MsgList),
+      {Offset + 1, drop_old_messages(BeginOffset, MsgList)};
+    _ ->
+      %% Not much info about offsets, give it a try at the very next offset.
+      {BeginOffset + 1, []}
+  end.
 
 %% @doc Fetch a single message set from the given topic-partition.
--spec fetch(connection() | {[endpoint()], conn_config()},
+-spec fetch(connection() | brod:client_id() | brod:bootstrap(),
             topic(), partition(), offset(), brod:fetch_opts()) ->
               {ok, {offset(), [brod:message()]}} | {error, any()}.
+fetch(Hosts, Topic, Partition, Offset, Opts) when is_list(Hosts) ->
+  fetch({Hosts, []}, Topic, Partition, Offset, Opts);
 fetch({Hosts, ConnCfg}, Topic, Partition, Offset, Opts) ->
   with_conn(
     kpro:connect_partition_leader(Hosts, ConnCfg, Topic, Partition),
     fun(Conn) -> fetch(Conn, Topic, Partition, Offset, Opts) end);
+fetch(Client, Topic, Partition, Offset, Opts) when is_atom(Client) ->
+  case brod_client:get_leader_connection(Client, Topic, Partition) of
+    {ok, Conn} ->
+      fetch(Conn, Topic, Partition, Offset, Opts);
+    {error, Reason} ->
+      {error, Reason}
+  end;
 fetch(Conn, Topic, Partition, Offset, Opts) ->
   Fetch = make_fetch_fun(Conn, Topic, Partition, Opts),
   Fetch(Offset).
+
+-spec fold(connection() | brod:client_id() | brod:bootstrap(),
+           topic(), partition(), offset(), brod:fetch_opts(),
+           Acc, brod:fold_fun(Acc), brod:fold_limits()) ->
+             brod:fold_result() when Acc :: brod:fold_acc().
+fold(Hosts, Topic, Partition, Offset, Opts,
+     Acc, Fun, Limits) when is_list(Hosts) ->
+  fold({Hosts, []}, Topic, Partition, Offset, Opts, Acc, Fun, Limits);
+fold({Hosts, ConnCfg}, Topic, Partition, Offset, Opts, Acc, Fun, Limits) ->
+  case with_conn(
+         kpro:connect_partition_leader(Hosts, ConnCfg, Topic, Partition),
+         fun(Conn) -> fold(Conn, Topic, Partition, Offset, Opts,
+                           Acc, Fun, Limits) end) of
+    {error, Reason} ->
+      ?BROD_FOLD_RET(Acc, Offset, {error, Reason});
+    ?BROD_FOLD_RET(_, _, _) = FoldResult ->
+      FoldResult
+  end;
+fold(Client, Topic, Partition, Offset, Opts,
+     Acc, Fun, Limits) when is_atom(Client) ->
+  case brod_client:get_leader_connection(Client, Topic, Partition) of
+    {ok, Conn} ->
+      %% do not close connection after use, managed by client
+      fold(Conn, Topic, Partition, Offset, Opts, Acc, Fun, Limits);
+    {error, Reason} ->
+      ?BROD_FOLD_RET(Acc, Offset, {error, Reason})
+  end;
+fold(Conn, Topic, Partition, Offset, Opts, Acc, Fun, Limits) ->
+  Fetch = make_fetch_fun(Conn, Topic, Partition, Opts),
+  Infinity = 1 bsl 64,
+  EndOffset = maps:get(reach_offset, Limits, Infinity),
+  CountLimit = maps:get(message_count, Limits, Infinity),
+  CountLimit < 1 andalso error(bad_message_count),
+  %% Function to spawn an async fetcher so it can fetch
+  %% the next batch while self() is folding the current
+  Spawn = fun(O) -> spawn_monitor(fun() -> exit(Fetch(O)) end) end,
+  do_fold(Spawn, Spawn(Offset), Offset, Acc, Fun, EndOffset, CountLimit).
 
 %% @doc Make a fetch function which should expand `max_bytes' when
 %% it is not big enough to fetch one signle message.
@@ -199,7 +273,7 @@ make_fetch_fun(Conn, Topic, Partition, FetchOpts) ->
   MinBytes = maps:get(min_bytes, FetchOpts, 1),
   MaxBytes = maps:get(max_bytes, FetchOpts, 1 bsl 20),
   ReqFun = make_req_fun(Conn, Topic, Partition, WaitTime, MinBytes),
-  fun(Offset) -> fetch(Conn, ReqFun, Offset, MaxBytes) end.
+  fun(Offset) -> ?MODULE:fetch(Conn, ReqFun, Offset, MaxBytes) end.
 
 -spec make_part_fun(brod:partitioner()) -> brod:partition_fun().
 make_part_fun(random) ->
@@ -236,7 +310,7 @@ fetch_committed_offsets(BootstrapEndpoints, ConnCfg, GroupId, Topics) ->
     kpro:connect_coordinator(BootstrapEndpoints, ConnCfg, Args),
     fun(Pid) -> do_fetch_committed_offsets(Pid, GroupId, Topics) end).
 
-%% @doc Fetch commited offsts for the given topics in a consumer group.
+%% @doc Fetch commited offsets for the given topics in a consumer group.
 %% 1. Get broker endpoint by calling
 %%    `brod_client:get_group_coordinator'
 %% 2. Establish a connecton to the discovered endpoint.
@@ -296,12 +370,17 @@ fetch(Conn, ReqFun, Offset, MaxBytes) ->
       {error, ErrorCode};
     {ok, #{batches := ?incomplete_batch(Size)}} ->
       fetch(Conn, ReqFun, Offset, Size);
-    {ok, #{header := Header, batches := Batches0}} ->
-      HighWmOffset = kpro:find(high_watermark, Header),
-      Batches = flatten_batches(Offset, Batches0),
-      case Offset < HighWmOffset andalso Batches =:= [] of
-        true -> fetch(Conn, ReqFun, Offset + 1, MaxBytes);
-        false -> {ok, {HighWmOffset, Batches}}
+    {ok, #{header := Header, batches := Batches}} ->
+      StableOffset = get_stable_offset(Header),
+      {NewBeginOffset, Msgs} = flatten_batches(Offset, Header, Batches),
+      case Offset < StableOffset andalso Msgs =:= [] of
+        true ->
+          %% Not reached the latest stable offset yet,
+          %% but received an empty batch-set (all messages are dropped).
+          %% try again with new begin-offset
+          fetch(Conn, ReqFun, NewBeginOffset, MaxBytes);
+        false ->
+          {ok, {StableOffset, Msgs}}
       end;
     {error, Reason} ->
       {error, Reason}
@@ -435,7 +514,103 @@ make_batch_input(Key, Value) ->
     false -> [unify_msg(make_msg_input(Key, Value))]
   end.
 
+%% @doc last_stable_offset is added in fetch response version 4
+%% This function takes high watermark offset as last_stable_offset
+%% in case it's missing.
+get_stable_offset(Header) ->
+  HighWmOffset = kpro:find(high_watermark, Header),
+  StableOffset = kpro:find(last_stable_offset, Header, HighWmOffset),
+  %% handle the case when high_watermark < last_stable_offset
+  min(StableOffset, HighWmOffset).
+
 %%%_* Internal functions =======================================================
+
+do_fold(Spawn, {Pid, Mref}, Offset, Acc, Fun, End, Count) ->
+  receive
+    {'DOWN', Mref, process, Pid, Result} ->
+      handle_fetch_rsp(Spawn, Result, Offset, Acc, Fun, End, Count)
+  end.
+
+handle_fetch_rsp(_Spawn, {error, Reason}, Offset, Acc, _Fun, _, _) ->
+  ?BROD_FOLD_RET(Acc, Offset, {fetch_failure, Reason});
+handle_fetch_rsp(_Spawn, {ok, {StableOffset, []}}, Offset, Acc, _Fun,
+                _End, _Count) when Offset >= StableOffset ->
+  ?BROD_FOLD_RET(Acc, Offset, reached_end_of_partition);
+handle_fetch_rsp(Spawn, {ok, {_StableOffset, Msgs}}, Offset, Acc, Fun,
+                 End, Count) ->
+  #kafka_message{offset = LastOffset} = lists:last(Msgs),
+  %% start fetching the next batch if not stopping at current
+  Fetcher = case LastOffset < End andalso length(Msgs) < Count of
+              true -> Spawn(LastOffset + 1);
+              false -> undefined
+            end,
+  do_acc(Spawn, Fetcher, Offset, Acc, Fun, Msgs, End, Count).
+
+do_acc(_Spawn, Fetcher, Offset, Acc, _Fun, _, _End, 0) ->
+  undefined = Fetcher, %% assert
+  ?BROD_FOLD_RET(Acc, Offset, reached_message_count_limit);
+do_acc(_Spawn, Fetcher, Offset, Acc, _Fun, _, End, _Count) when Offset > End ->
+  undefined = Fetcher, %% assert
+  ?BROD_FOLD_RET(Acc, Offset, reached_target_offset);
+do_acc(Spawn, Fetcher, Offset, Acc, Fun, [], End, Count) ->
+  do_fold(Spawn, Fetcher, Offset, Acc, Fun, End, Count);
+do_acc(Spawn, Fetcher, Offset, Acc, Fun, [Msg | Rest], End, Count) ->
+  try Fun(Msg, Acc) of
+    {ok, NewAcc} ->
+      NextOffset = Msg#kafka_message.offset + 1,
+      do_acc(Spawn, Fetcher, NextOffset, NewAcc, Fun, Rest, End, Count - 1);
+    {error, Reason} ->
+      ok = kill_fetcher(Fetcher),
+      ?BROD_FOLD_RET(Acc, Offset, Reason)
+  catch
+    C : E ?BIND_STACKTRACE(Stack) ->
+      ?GET_STACKTRACE(Stack),
+      kill_fetcher(Fetcher),
+      erlang:raise(C, E, Stack)
+  end.
+
+kill_fetcher({Pid, Mref}) ->
+  exit(Pid, kill),
+  receive
+    {'DOWN', Mref, process, _, _} ->
+      ok
+  end.
+
+drop_aborted(#{aborted_transactions := AbortedL}, Batches) ->
+  %% Drop batches for each abored transaction
+  lists:foldl(
+    fun(#{producer_id := ProducerId, first_offset := FirstOffset}, BatchesIn) ->
+        do_drop_aborted(ProducerId, FirstOffset, BatchesIn, [])
+    end, Batches, AbortedL);
+drop_aborted(_, Batches) ->
+  %% old version, no aborted_transactions field
+  Batches.
+
+do_drop_aborted(_, _, [], Acc) -> lists:reverse(Acc);
+do_drop_aborted(ProducerId, FirstOffset, [{_Meta, []} | Batches], Acc) ->
+  %% all messages are deleted (compacted topic)
+  do_drop_aborted(ProducerId, FirstOffset, Batches, Acc);
+do_drop_aborted(ProducerId, FirstOffset, [{Meta, Msgs} | Batches], Acc) ->
+  #kafka_message{offset = BaseOffset} = hd(Msgs),
+  case {is_txn(Meta, ProducerId), is_control(Meta)} of
+    {true, true} ->
+      %% this is the end of a transaction
+      %% no need to scan remaining batches
+      lists:reverse(Acc) ++ Batches;
+    {true, false} when BaseOffset >= FirstOffset ->
+      %% this batch is a part of aborted transaction, drop it
+      do_drop_aborted(ProducerId, FirstOffset, Batches, Acc);
+    _ ->
+      do_drop_aborted(ProducerId, FirstOffset, Batches, [{Meta, Msgs} | Acc])
+  end.
+
+%% Return true if a batch is in a transaction from the given producer.
+is_txn(#{is_transaction := true,
+         producer_id := Id}, Id) -> true;
+is_txn(_ProducerId, _Meta) -> false.
+
+is_control(#{is_control := true}) -> true;
+is_control(_) -> false.
 
 %% Make a function to build fetch requests.
 %% The function takes offset and max_bytes as input as these two parameters

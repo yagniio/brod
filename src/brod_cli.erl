@@ -24,14 +24,6 @@
 
 -define(CLIENT, brod_cli_client).
 
--ifdef(OTP_RELEASE).
--define(BIND_STACKTRACE(Var), :Var).
--define(GET_STACKTRACE(Var), ok).
--else.
--define(BIND_STACKTRACE(Var), ).
--define(GET_STACKTRACE(Var), Var = erlang:get_stacktrace()).
--endif.
-
 %% 'halt' is for escript, stop the vm immediately
 %% 'exit' is for testing, we want eunit or ct to be able to capture
 -define(STOP(How),
@@ -70,12 +62,14 @@ commands:
 "  --ssl                  Use TLS, validate server using trusted CAs
   --cacertfile=<cacert>  Use TLS, validate server using the given certificate
   --certfile=<certfile>  Client certificate in case client authentication
-                         is enabled in borkers
+                         is enabled in brokers
   --keyfile=<keyfile>    Client private key in case client authentication
-                         is enabled in borkers
+                         is enabled in brokers
   --sasl-plain=<file>    Tell brod to use username/password stored in the
                          given file, the file should have username and
                          password in two lines.
+  --scram256=<file>      Like sasl-plain option, but to use scram-sha-256
+  --scram512=<file>      Like sasl-plain option, but to use scram-sha-512
   --ebin-paths=<dirs>    Comma separated directory names for extra beams,
                          This is to support user compiled message formatters
   --no-api-vsn-query     Do not query api version (for kafka 0.9 or earlier)
@@ -432,9 +426,9 @@ run(?OFFSET_CMD, Brokers, Topic, SockOpts, Args) ->
   after
     brod_client:stop(?CLIENT)
   end;
-run(?FETCH_CMD, Brokers, Topic, SockOpts, Args) ->
+run(?FETCH_CMD, Brokers, Topic, ConnOpts, Args) ->
   Partition = parse(Args, "--partition", fun int/1), %% not parse_partition/1
-  Count0 = parse(Args, "--count", fun int/1),
+  Count = parse(Args, "--count", fun int/1),
   Offset0 = parse(Args, "--offset", fun parse_offset_time/1),
   Wait = parse(Args, "--wait", fun parse_timeout/1),
   KvDeli = parse(Args, "--kv-deli", fun parse_delimiter/1),
@@ -444,15 +438,32 @@ run(?FETCH_CMD, Brokers, Topic, SockOpts, Args) ->
                      parse_fmt(FmtOption, KvDeli, MsgDeli)
                  end),
   MaxBytes = parse(Args, "--max-bytes", fun parse_size/1),
-  {ok, Sock} = brod:connect_leader(Brokers, Topic, Partition, SockOpts),
-  Offset = resolve_begin_offset(Sock, Topic, Partition, Offset0),
+  {ok, Conn} = brod:connect_leader(Brokers, Topic, Partition, ConnOpts),
+  Offset = resolve_begin_offset(Conn, Topic, Partition, Offset0),
   FetchOpts = #{max_wait_time => Wait, max_bytes => MaxBytes},
-  FetchFun = brod_utils:make_fetch_fun(Sock, Topic, Partition, FetchOpts),
-  Count = case Count0 < 0 of
-            true -> 1000000000; %% as if an infinite loop
-            false -> Count0
+  FoldLimits = case Count < 0 of
+                 true -> #{};
+                 false -> #{message_count => Count}
+               end,
+  FoldFun =
+    fun(M, Acc) ->
+      #kafka_message{offset = O, key = K, value = V} = M,
+      R = case is_function(FmtFun, 3) of
+            true -> FmtFun(O, K, V);
+            false -> FmtFun(M)
           end,
-  fetch_loop(FmtFun, FetchFun, Offset, Count);
+      case R of
+        ok -> ok;
+        IoData -> print(IoData)
+      end,
+      {ok, Acc + 1}
+    end,
+  {FetchedCount, NextOffset, Reason} =
+    brod:fold(Conn, Topic, Partition, Offset, FetchOpts,
+              0, FoldFun, FoldLimits),
+  logerr("Fetch loop stopped after ~p messages~n", [FetchedCount]),
+  logerr("Continue at Offset: ~p~n", [NextOffset]),
+  logerr("Reason: ~p~n", [Reason]);
 run(?SEND_CMD, Brokers, Topic, SockOpts, Args) ->
   Partition = parse(Args, "--partition", fun parse_partition/1),
   Acks = parse(Args, "--acks", fun parse_acks/1),
@@ -704,7 +715,10 @@ pp_fmt_struct(Indent, Fields0) when is_list(Fields0) ->
              [_] -> Fields0;
              _ -> lists:keydelete(no_error, 2, Fields0)
            end,
-  F = fun(IsFirst, {N, V}) ->
+  F = fun(IsFirst, {N, V}) when is_map(V) ->
+          indent_fmt(IsFirst, Indent,
+                     "~p:\n~s", [N, pp_fmt_struct(Indent + 1, V)]);
+          (IsFirst, {N, V}) ->
           indent_fmt(IsFirst, Indent,
                      "~p: ~s", [N, pp_fmt_struct_value(Indent, V)])
       end,
@@ -717,18 +731,16 @@ pp_fmt_struct_value(_Indent, X) when is_integer(X) orelse
                                      is_binary(X) orelse
                                      X =:= [] ->
   [pp_fmt_prim(X), "\n"];
-pp_fmt_struct_value(Indent, [{_, _}|_] = SubStruct) ->
-  ["\n", pp_fmt_struct(Indent + 1, SubStruct)];
-pp_fmt_struct_value(Indent, Array) when is_list(Array) ->
-  case hd(Array) of
-    [{_, _}|_] ->
+pp_fmt_struct_value(Indent, [H | _] = Array) when is_list(Array) ->
+  case is_tuple(H) orelse is_map(H) of
+    true ->
       %% array of sub struct
       ["\n",
        lists:map(fun(Item) ->
                      pp_fmt_struct(Indent + 1, Item)
                  end, Array)
       ];
-    _ ->
+    false ->
       %% array of primitive values
       [[pp_fmt_prim(V) || V <- Array], "\n"]
   end.
@@ -739,7 +751,7 @@ pp_fmt_prim(A) when is_atom(A) -> atom_to_list(A);
 pp_fmt_prim(S) when is_binary(S) -> S.
 
 indent_fmt(true, Indent, Fmt, Args) ->
-  ["- ", indent_fmt(false, Indent - 1, Fmt, Args)];
+  io_lib:format(lists:duplicate((Indent - 1) * 2, $\s) ++ "- " ++ Fmt, Args);
 indent_fmt(false, Indent, Fmt, Args) ->
   io_lib:format(lists:duplicate(Indent * 2, $\s) ++ Fmt, Args).
 
@@ -797,40 +809,6 @@ flush_pending_acks(Queue, Timeout) ->
         {error, timeout} ->
           Queue
       end
-  end.
-
-fetch_loop(_FmtFun, _FetchFun, _Offset, 0) ->
-  verbose("done (count)\n"),
-  ok;
-fetch_loop(FmtFun, FetchFun, Offset, Count) ->
-  debug("Fetching from offset: ~p\n", [Offset]),
-  case FetchFun(Offset) of
-    {ok, {_, []}} ->
-      %% reached max_wait, no message received
-      verbose("done (wait)\n"),
-      ok;
-    {ok, {_HmOffset, Messages0}} ->
-      {Messages, NewCount} =
-        case length(Messages0) of
-          N when N > Count ->
-            {lists:sublist(Messages0, Count), 0};
-          N ->
-            {Messages0, Count - N}
-        end,
-      #kafka_message{offset = LastOffset} = lists:last(Messages),
-      lists:foreach(
-        fun(M) ->
-            #kafka_message{offset = O, key = K, value = V} = M,
-            R = case is_function(FmtFun, 3) of
-                  true -> FmtFun(O, K, V);
-                  false -> FmtFun(M)
-                end,
-            case R of
-              ok -> ok;
-              IoData -> print(IoData)
-            end
-        end, Messages),
-      fetch_loop(FmtFun, FetchFun, LastOffset + 1, NewCount)
   end.
 
 resolve_begin_offset(_Sock, _T, _P, Offset) when is_integer(Offset) ->
@@ -1149,12 +1127,18 @@ parse_connection_config(Args) ->
            {keyfile, KeyFile}],
         lists:filter(FilterPred, Files)
     end,
-  SaslOpt = parse(Args, "--sasl-plain", fun parse_file/1),
-  SaslOpts = sasl_opts(SaslOpt),
+  SaslPlain = parse(Args, "--sasl-plain", fun parse_file/1),
+  SaslScram256 = parse(Args, "--scram256", fun parse_file/1),
+  SaslScram512 = parse(Args, "--scram512", fun parse_file/1),
+  SaslOpts0 = [ {scram_sha_512, SaslScram512}
+              , {scram_sha_256, SaslScram256}
+              , {plain, SaslPlain}
+              ],
+  SaslOpts = case lists:filter(FilterPred, SaslOpts0) of
+               [] -> [];
+               [H | _] -> [{sasl, H}]
+             end,
   lists:filter(FilterPred, [{ssl, SslOpt} | SaslOpts]).
-
-sasl_opts(?undef) -> [];
-sasl_opts(File)   -> [{sasl, {plain, File}}].
 
 parse_boolean(true) -> true;
 parse_boolean(false) -> false;
@@ -1208,8 +1192,6 @@ logerr(IoData) -> io:put_chars(stderr(), ["*** ", IoData]).
 
 logerr(Fmt, Args) ->
   io:put_chars(stderr(), io_lib:format("*** " ++ Fmt, Args)).
-
-verbose(Str) -> verbose(Str, []).
 
 verbose(Fmt, Args) ->
   case erlang:get(brod_cli_log_level) >= ?LOG_LEVEL_VERBOSE of

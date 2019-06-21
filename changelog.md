@@ -139,7 +139,7 @@
 * 3.7.4
   * Add callback to make user_data in group join request
 * 3.7.5
-  * Bump kafka protocol version to 2.2.7
+  * Bump kafka_protocol version to 2.2.7
   * Fix empty assignment handling. In case a group member has no partition assigned,
     `member_assignment` data field in group sync response can either be `null` (kafka 0.10)
     or a struct having empty `topic_partitions` (kafka 0.11 or later). The later case
@@ -149,3 +149,32 @@
 * 3.7.7
   * Fix `badrecord` race: message-set is delivered to `brod_group_subscriber` after
     unsubscribed from `brod_consumer`.
+* 3.7.8
+  * Drop batches in aborted transactions (and all control batches)
+    also improve offset fast-forwarding when empty batches are received
+* 3.7.9
+  * Fix brod-cli escript include apps
+  * Fix brod-cli sub-record formatting crash
+  * Upgrade to kafka_protocol 2.2.8 to discard replica_not_available error code in metadata response
+  * Fix empty responses field in fetch response #323
+* 3.7.10
+  * Compare begin_offset with last stable offset before advancing to next offset in case empty
+    batch is received. Prior to this version, fetch attempts on unstable messages (messages
+    belong to open transactions (transactions which are neigher committed nor aborted),
+    may result in an empty message set, then `brod_consumer` or `brod_utils:fetch` jumps to
+    the next offset (if it is less than high-watermark offset).
+* 3.7.11
+  * Fix a bug when dropping aborted transactions for compacted topics
+* 3.8.0
+  * Bump to kafka_protocol 2.2.9 (allow `atom()` hostname)
+  * Add `brod:fold/8`. This API spawns a process to fetch-ahead while folding the previously
+    fetched batch. `brod-cli`'s `fetch` command is updated to call this `fold` API for better
+    performance.
+  * Add callbacks to allow `brod_client:stop_producer` and `brod_client:stop_consumer` to remove
+    the stopped child references from the supervisor and clean up the client ets table to allow
+    later restart.
+  * Support scram SASL authentication in brod-cli
+  * Made possible to start-link or supervise `brod_consumer` in user apps, instead of always
+    under `brod_client`'s `brod_consumers_sup`
+* 3.8.1
+  * Handle the case when high_watermark < last_stable_offset in fetch resp
