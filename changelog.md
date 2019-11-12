@@ -178,3 +178,14 @@
     under `brod_client`'s `brod_consumers_sup`
 * 3.8.1
   * Handle the case when high_watermark < last_stable_offset in fetch resp
+* 3.9.0
+  * Updated kafka_protocol dependency to 2.3.1
+  * (Experimental) Added group_subscriber_v2 behavior
+  * Added API for topic deletion and creation
+* 3.9.1
+  * Receive pending acks after assignments_revoked is invoked
+* 3.9.2
+  * Fix corrupted package published to hex
+* 3.9.3
+  * Remove vsn-check dependency from default Makefile target
+    This enables using brod with erlang.mk + hex

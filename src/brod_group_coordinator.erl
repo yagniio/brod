@@ -148,59 +148,95 @@
 %%%_* APIs =====================================================================
 
 %% @doc Start a kafka consumer group coordinator.
-%% Client:    ClientId (or pid, but not recommended)
-%% GroupId:   Predefined globally unique (in a kafka cluster) binary string.
-%% Topics:    Predefined set of topic names to join the group.
-%% CbModule:  The module which implements group coordinator callbacks
-%% MemberPid: The member process pid.
-%% Config: The group coordinator configs in a proplist, possible entries:
-%%  - partition_assignment_strategy  (optional, default = roundrobin_v2)
-%%      roundrobin_v2 (topic-sticky):
-%%        Take all topic-offset (sorted [{TopicName, Partition}] list)
-%%        assign one to each member in a roundrobin fashion. However only
-%%        partitions in the subscription topic list are assiged.
-%%      callback_implemented
-%%        Call CbModule:assign_partitions/2 to assign partitions.
-%%  - session_timeout_seconds (optional, default = 10)
+%%
+%% `Client': `ClientId' (or pid, but not recommended)
+%%
+%% `GroupId': Predefined globally unique (in a kafka cluster) binary string.
+%%
+%% `Topics': Predefined set of topic names to join the group.
+%%
+%% `CbModule':  The module which implements group coordinator callbacks
+%%
+%% `MemberPid': The member process pid.
+%%
+%% `Config': The group coordinator configs in a proplist, possible entries:
+%%
+%%  <ul><li>`partition_assignment_strategy' (optional, default =
+%%  `roundrobin_v2')
+%%
+%%  Possible values:
+%%
+%%      <ul><li>`roundrobin_v2' (topic-sticky)
+%%
+%%        Take all topic-offset (sorted `topic_partition()' list),
+%%        assign one to each member in a roundrobin fashion. Only
+%%        partitions in the subscription topic list are assiged.</li>
+%%
+%%      <li>`callback_implemented'
+%%
+%%        Call `CbModule:assign_partitions/2' to assign
+%%        partitions.</li>
+%%  </ul></li>
+%%
+%%  <li>`session_timeout_seconds' (optional, default = 10)
+%%
 %%      Time in seconds for the group coordinator broker to consider a member
 %%      'down' if no heartbeat or any kind of requests received from a broker
 %%      in the past N seconds.
 %%      A group member may also consider the coordinator broker 'down' if no
-%%      heartbeat response response received in the past N seconds.
-%%  - heartbeat_rate_seconds (optional, default = 2)
+%%      heartbeat response response received in the past N seconds.</li>
+%%
+%%  <li>`heartbeat_rate_seconds' (optional, default = 2)
+%%
 %%      Time in seconds for the member to 'ping' the group coordinator.
 %%      OBS: Care should be taken when picking the number, on one hand, we do
 %%           not want to flush the broker with requests if we set it too low,
 %%           on the other hand, if set it too high, it may take too long for
 %%           the members to realise status changes of the group such as
-%%           assignment rebalacing or group coordinator switchover etc.
-%%  - max_rejoin_attempts (optional, default = 5)
+%%           assignment rebalacing or group coordinator switchover etc.</li>
+%%
+%%  <li>`max_rejoin_attempts' (optional, default = 5)
+%%
 %%      Maximum number of times allowd for a member to re-join the group.
 %%      The gen_server will stop if it reached the maximum number of retries.
 %%      OBS: 'let it crash' may not be the optimal strategy here because
 %%           the group member id is kept in the gen_server looping state and
-%%           it is reused when re-joining the group.
-%%  - rejoin_delay_seconds (optional, default = 1)
-%%      Delay in seconds before re-joining the group.
-%%  - offset_commit_policy (optional, default = commit_to_kafka_v2)
-%%      How/where to commit offsets, possible values:
-%%        - commit_to_kafka_v2:
-%%            Group coordinator will commit the offsets to kafka using
-%%            version 2 OffsetCommitRequest.
-%%        - consumer_managed:
-%%            The group member (e.g. brod_group_subscriber.erl) is responsible
-%%            for persisting offsets to a local or centralized storage.
-%%            And the callback get_committed_offsets should be implemented
-%%            to allow group coordinator to retrieve the commited offsets.
-%%  - offset_commit_interval_seconds (optional, default = 5)
+%%           it is reused when re-joining the group.</li>
+%%
+%%  <li>`rejoin_delay_seconds' (optional, default = 1)
+%%
+%%      Delay in seconds before re-joining the group.</li>
+%%
+%%  <li>`offset_commit_policy' (optional, default = `commit_to_kafka_v2')
+%%
+%%      How/where to commit offsets, possible values:<ul>
+%%        <li>`commit_to_kafka_v2': Group coordinator will commit the
+%%            offsets to kafka using version 2
+%%            OffsetCommitRequest.</li>
+%%        <li> `consumer_managed': The group member
+%%            (e.g. brod_group_subscriber.erl) is responsible for
+%%            persisting offsets to a local or centralized storage.
+%%            And the callback `get_committed_offsets' should be
+%%            implemented to allow group coordinator to retrieve the
+%%            commited offsets.</li>
+%%  </ul></li>
+%%
+%%  <li>`offset_commit_interval_seconds' (optional, default = 5)
+%%
 %%      The time interval between two OffsetCommitRequest messages.
-%%      This config is irrelevant if offset_commit_policy is consumer_managed.
-%%  - offset_retention_seconds (optional, default = -1)
+%%      This config is irrelevant if `offset_commit_policy' is
+%%      `consumer_managed'.</li>
+%%
+%%  <li>`offset_retention_seconds' (optional, default = -1)
+%%
 %%      How long the time is to be kept in kafka before it is deleted.
-%%      The default special value -1 indicates that the __consumer_offsets
-%%      topic retention policy is used.
-%%      This config is irrelevant if offset_commit_policy is consumer_managed.
-%%  - protocol_name (optional, default = roundrobin_v2)
+%%      The default special value -1 indicates that the
+%%      __consumer_offsets topic retention policy is used. This config
+%%      is irrelevant if `offset_commit_policy' is
+%%      `consumer_managed'.</li>
+%%
+%%  <li>`protocol_name' (optional, default = roundrobin_v2)
+%%
 %%      This is the protocol name used when join a group, if not given,
 %%      by default `partition_assignment_strategy' is used as the protocol name.
 %%      Setting a protocol name allows to interact with consumer group members
@@ -208,6 +244,8 @@
 %%      commonly used protocol name for JAVA client. However, brod only supports
 %%      roundrobin protocol out of the box, in order to mimic 'range' protocol
 %%      one will have to do it via `callback_implemented' assignment strategy
+%%  </li>
+%% </ul>
 -spec start_link(brod:client(), brod:group_id(), [brod:topic()],
                  config(), module(), pid()) -> {ok, pid()} | {error, any()}.
 start_link(Client, GroupId, Topics, Config, CbModule, MemberPid) ->
@@ -228,9 +266,10 @@ commit_offsets(CoordinatorPid) ->
 
 %% @doc Force commit collected (acked) offsets plus the given extra offsets
 %% immediately.
-%% NOTE: A lists:usrot is applied on the given extra offsets to commit
+%%
+%% NOTE: `lists:usort/1' is applied on the given extra offsets to commit,
 %%       meaning if two or more offsets for the same topic-partition exist
-%%       in the list, only the one that is closer the head of the list is kept
+%%       in the list, only the one closest the head of the list is kept
 -spec commit_offsets(pid(),
                      [{{brod:topic(), brod:partition()}, brod:offset()}]) ->
                         ok | {error, any()}.
@@ -287,14 +326,7 @@ init({Client, GroupId, Topics, Config, CbModule, MemberPid}) ->
   {ok, State}.
 
 handle_info({ack, GenerationId, Topic, Partition, Offset}, State) ->
-  case GenerationId < State#state.generationId of
-    true  ->
-      %% Ignore stale acks
-      {noreply, State};
-    false ->
-      {ok, NewState} = handle_ack(State, Topic, Partition, Offset),
-      {noreply, NewState}
-  end;
+  {noreply, handle_ack(State, GenerationId, Topic, Partition, Offset)};
 handle_info(?LO_CMD_COMMIT_OFFSETS, #state{is_in_group = true} = State) ->
   {ok, NewState} =
     try
@@ -434,29 +466,36 @@ stabilize(#state{ rejoin_delay_seconds = RejoinDelaySeconds
   %% 1. unsubscribe all currently assigned partitions
   ok = MemberModule:assignments_revoked(MemberPid),
 
-  %% 2. try to commit current offsets before re-joinning the group.
+  %% 2. some brod_group_member implementations may wait for messages
+  %%    to finish processing when assignments_revoked is called.
+  %%    The acknowledments of those messages would then be sitting
+  %%    in our inbox. So we do an explicit pass to collect all pending
+  %%    acks so they are included in the best-effort commit below.
+  State1 = receive_pending_acks(State0),
+
+  %% 3. try to commit current offsets before re-joinning the group.
   %%    try only on the first re-join attempt
   %%    do not try if it was illegal generation exception received
   %%    because it will fail on the same exception again
-  State1 =
+  State2 =
     case AttemptNo =:= 0 andalso
          Reason    =/= ?illegal_generation of
       true ->
-        {ok, #state{} = State1_} = try_commit_offsets(State0),
-        State1_;
+        {ok, #state{} = State2_} = try_commit_offsets(State1),
+        State2_;
       false ->
-        State0
+        State1
     end,
-  State2 = State1#state{is_in_group = false},
+  State3 = State2#state{is_in_group = false},
 
-  %$ 3. Clean up state based on the last failure reason
-  State = maybe_reset_member_id(State2, Reason),
+  %$ 4. Clean up state based on the last failure reason
+  State = maybe_reset_member_id(State3, Reason),
 
-  %% 4. ensure we have a connection to the (maybe new) group coordinator
+  %% 5. ensure we have a connection to the (maybe new) group coordinator
   F1 = fun discover_coordinator/1,
-  %% 5. join group
+  %% 6. join group
   F2 = fun join_group/1,
-  %% 6. sync assignemnts
+  %% 7. sync assignemnts
   F3 = fun sync_group/1,
 
   RetryFun =
@@ -473,6 +512,16 @@ stabilize(#state{ rejoin_delay_seconds = RejoinDelaySeconds
       {ok, StateIn}
     end,
   do_stabilize([F1, F2, F3], RetryFun, State).
+
+-spec receive_pending_acks(state()) -> state().
+receive_pending_acks(State) ->
+  receive
+    {ack, GenerationId, Topic, Partition, Offset} ->
+      NewState = handle_ack(State, GenerationId, Topic, Partition, Offset),
+      receive_pending_acks(NewState)
+  after
+    0 -> State
+  end.
 
 do_stabilize([], _RetryFun, State) ->
   {ok, State};
@@ -579,13 +628,16 @@ sync_group(#state{ groupId       = GroupId
       [format_assignments(TopicAssignments)]),
   start_offset_commit_timer(NewState).
 
--spec handle_ack(state(), brod:topic(), brod:partition(), brod:offset()) ->
-        {ok, state()}.
-handle_ack(#state{ acked_offsets = AckedOffsets
-                 } = State, Topic, Partition, Offset) ->
+-spec handle_ack(state(), brod:group_generation_id(), brod:topic(),
+                 brod:partition(), brod:offset()) -> state().
+handle_ack(State, GenerationId, _Topic, _Partition, _Offset)
+    when GenerationId < State#state.generationId ->
+  State;
+handle_ack(#state{acked_offsets = AckedOffsets} = State,
+           _GenerationId, Topic, Partition, Offset) ->
   NewAckedOffsets =
     merge_acked_offsets(AckedOffsets, [{{Topic, Partition}, Offset}]),
-  {ok, State#state{acked_offsets = NewAckedOffsets}}.
+  State#state{acked_offsets = NewAckedOffsets}.
 
 %% Add new offsets to be acked into the acked offsets collection.
 -spec merge_acked_offsets(Offsets, Offsets) -> Offsets when

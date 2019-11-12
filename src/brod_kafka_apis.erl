@@ -14,6 +14,7 @@
 %%%   limitations under the License.
 %%%
 
+%% @private
 %% Version ranges are cached per host and per connection pid in ets
 
 -module(brod_kafka_apis).
@@ -149,6 +150,8 @@ supported_versions(API) ->
     sync_group       -> {0, 0};
     describe_groups  -> {0, 0};
     list_groups      -> {0, 0};
+    create_topics    -> {0, 0};
+    delete_topics    -> {0, 0};
     _                -> erlang:error({unsupported_api, API})
   end.
 
