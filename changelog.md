@@ -189,3 +189,10 @@
 * 3.9.3
   * Remove vsn-check dependency from default Makefile target
     This enables using brod with erlang.mk + hex
+  * Bump kafka_protocol dependency to 2.3.2
+* 3.9.4
+  * Handle undefined fetcher in fold loop exception
+* 3.9.5
+  * Bump kafka_protocol dependency to 2.3.3
+* 3.10.0
+  * Stop supporting erlang.mk
