@@ -59,7 +59,7 @@
 -include("brod_group_subscriber_test.hrl").
 
 -define(handled_message(Topic, Partition, Value, Offset),
-        #{ kind      := group_subscriber_handle_message
+        #{ ?snk_kind := group_subscriber_handle_message
          , topic     := Topic
          , partition := Partition
          , value     := Value
@@ -299,7 +299,7 @@ t_consumer_crash(Config) when is_list(Config) ->
        ok = Behavior:ack(SubscriberPid, Topic, Partition, O3),
        sys:get_state(SubscriberPid),
        {ok, ConsumerPid} = brod:get_consumer(?CLIENT_ID, Topic, Partition),
-       kill_process(ConsumerPid),
+       kafka_test_helper:kill_process(ConsumerPid),
        %% send more messages (but they should not be received until
        %% re-subscribe)
        [SendFun(I) || I <- lists:seq(6, 8)],
@@ -314,7 +314,9 @@ t_consumer_crash(Config) when is_list(Config) ->
                                               ),
          %% Check that messages 6 to 8 were processed after message 5
          %% was acked:
-         {_BeforeAck, [_|AfterAck]} = ?split_trace_at(#{kind := ack_o5}, Trace),
+         {_BeforeAck, [_|AfterAck]} = ?split_trace_at( #{?snk_kind := ack_o5}
+                                                     , Trace
+                                                     ),
          ?assertEqual( [<<I>> || I <- lists:seq(6, 8)]
                      , ?projection(value, handled_messages(AfterAck))
                      )
@@ -452,9 +454,9 @@ t_async_commit(Config) when is_list(Config) ->
      %% Check stage:
      fun(_Ret, Trace) ->
          {BeforeRestart1, [_|AfterRestart1]} =
-           ?split_trace_at(#{kind := emulate_restart}, Trace),
+           ?split_trace_at(#{?snk_kind := emulate_restart}, Trace),
          {BeforeRestart2, [_|AfterRestart2]} =
-           ?split_trace_at(#{kind := emulate_restart}, AfterRestart1),
+           ?split_trace_at(#{?snk_kind := emulate_restart}, AfterRestart1),
          %% check that the message was processed once before 1st
          %% restart:
          ?assertMatch( [_]
@@ -469,7 +471,15 @@ t_async_commit(Config) when is_list(Config) ->
          %% had been committed:
          ?assertMatch( []
                      , ?projection(value, handled_messages(AfterRestart2))
-                     )
+                     ),
+         %% Check that terminate callback was called on each restart
+         %% (for the new behavior):
+         Behavior =:= brod_group_subscriber orelse
+           ?assertMatch( [ #{topic := Topic, partition := Partition}
+                         , #{topic := Topic, partition := Partition}
+                         ]
+                       , ?of_kind(brod_test_group_subscriber_terminate, Trace)
+                       )
      end).
 
 t_assign_partitions_handles_updating_state(Config) when is_list(Config) ->
@@ -560,17 +570,6 @@ start_subscriber(Config, Topics, GroupConfig, ConsumerConfig, InitArgs) ->
 
 stop_subscriber(Config, Pid) ->
   (?config(behavior)):stop(Pid).
-
-kill_process(Pid) ->
-  Mon = monitor(process, Pid),
-  ?tp(kill_consumer, #{pid => Pid}),
-  exit(Pid, kill),
-  receive
-    {'DOWN', Mon, process, Pid, killed} ->
-      ok
-  after 1000 ->
-      ct:fail("timed out waiting for the process to die")
-  end.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

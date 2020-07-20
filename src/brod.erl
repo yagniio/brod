@@ -70,9 +70,13 @@
         ]).
 
 %% Subscriber API
+-export([ start_link_group_subscriber_v2/1
+        , start_link_topic_subscriber/1
+        ]).
+
+%% Deprecated API
 -export([ start_link_group_subscriber/7
         , start_link_group_subscriber/8
-        , start_link_group_subscriber_v2/1
         , start_link_topic_subscriber/5
         , start_link_topic_subscriber/6
         , start_link_topic_subscriber/7
@@ -749,6 +753,7 @@ start_link_group_subscriber(Client, GroupId, Topics, GroupConfig,
 
 %% @equiv start_link_topic_subscriber(Client, Topic, 'all', ConsumerConfig,
 %%                                    CbModule, CbInitArg)
+%% @deprecated Please use {@link start_link_topic_subscriber/1} instead
 -spec start_link_topic_subscriber(
         client(), topic(), consumer_config(), module(), term()) ->
           {ok, pid()} | {error, any()}.
@@ -760,6 +765,7 @@ start_link_topic_subscriber(Client, Topic, ConsumerConfig,
 %% @equiv start_link_topic_subscriber(Client, Topic, Partitions,
 %%                                    ConsumerConfig, message,
 %%                                    CbModule, CbInitArg)
+%% @deprecated Please use {@link start_link_topic_subscriber/1} instead
 -spec start_link_topic_subscriber(
         client(), topic(), all | [partition()],
         consumer_config(), module(), term()) ->
@@ -770,6 +776,7 @@ start_link_topic_subscriber(Client, Topic, Partitions,
                               ConsumerConfig, message, CbModule, CbInitArg).
 
 %% @see brod_topic_subscriber:start_link/7
+%% @deprecated Please use {@link start_link_topic_subscriber/1} instead
 -spec start_link_topic_subscriber(
         client(), topic(), all | [partition()],
         consumer_config(), message | message_set,
@@ -781,10 +788,17 @@ start_link_topic_subscriber(Client, Topic, Partitions,
                                    ConsumerConfig, MessageType,
                                    CbModule, CbInitArg).
 
+%% @see brod_topic_subscriber:start_link/1
+-spec start_link_topic_subscriber(
+        brod_topic_subscriber:topic_subscriber_config()
+       ) -> {ok, pid()} | {error, any()}.
+start_link_topic_subscriber(Config) ->
+  brod_topic_subscriber:start_link(Config).
+
 %% @equiv create_topics(Hosts, TopicsConfigs, RequestConfigs, [])
 -spec create_topics([endpoint()], [topic_config()], #{timeout => kpro:int32(),
                     validate_only => boolean()}) ->
-        {ok, kpro:struct()} | {error, any()}.
+        ok | {ok, kpro:struct()} | {error, any()}.
 create_topics(Hosts, TopicConfigs, RequestConfigs) ->
   brod_utils:create_topics(Hosts, TopicConfigs, RequestConfigs).
 
@@ -793,13 +807,13 @@ create_topics(Hosts, TopicConfigs, RequestConfigs) ->
 %% See `kpro_schema.erl' for struct details
 -spec create_topics([endpoint()], [topic_config()], #{timeout => kpro:int32(),
                     validate_only => boolean()}, conn_config()) ->
-        {ok, kpro:struct()} | {error, any()}.
+        ok | {ok, kpro:struct()} | {error, any()}.
 create_topics(Hosts, TopicConfigs, RequestConfigs, Options) ->
   brod_utils:create_topics(Hosts, TopicConfigs, RequestConfigs, Options).
 
 %% @equiv delete_topics(Hosts, Topics, Timeout, [])
 -spec delete_topics([endpoint()], [topic()], pos_integer()) ->
-        {ok, kpro:struct()} | {error, any()}.
+        ok | {ok, kpro:struct()} | {error, any()}.
 delete_topics(Hosts, Topics, Timeout) ->
   brod_utils:delete_topics(Hosts, Topics, Timeout).
 
@@ -807,7 +821,7 @@ delete_topics(Hosts, Topics, Timeout) ->
 %% Return the message body of `delete_topics', response.
 %% See `kpro_schema.erl' for struct details
 -spec delete_topics([endpoint()], [topic()], pos_integer(), conn_config()) ->
-        {ok, kpro:struct()} | {error, any()}.
+        ok | {ok, kpro:struct()} | {error, any()}.
 delete_topics(Hosts, Topics, Timeout, Options) ->
   brod_utils:delete_topics(Hosts, Topics, Timeout, Options).
 
